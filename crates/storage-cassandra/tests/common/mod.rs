@@ -12,6 +12,7 @@ use extenddb_storage::TableEngine;
 use extenddb_storage_cassandra::{
     CassandraCatalogStore, CassandraEngine, CassandraSession, CassandraStorageConfig,
 };
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
 /// Keyspaces queued for async drop between tests.
@@ -46,10 +47,32 @@ pub async fn flush_pending_drops(session: &Arc<CassandraSession>) {
         let _ = session.query(format!("DROP KEYSPACE IF EXISTS {ks}")).await;
     }
 }
+const DEFAULT_TEST_CONTACT_POINT: &str = "127.0.0.1:9042";
+const TEST_CONTACT_POINT_ENV: &str = "EXTENDDB_TEST_CASSANDRA_CONTACT_POINT";
+
+fn test_contact_point() -> String {
+    resolve_test_contact_point(std::env::var(TEST_CONTACT_POINT_ENV).ok().as_deref())
+}
+
+fn resolve_test_contact_point(value: Option<&str>) -> String {
+    let contact_point = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_TEST_CONTACT_POINT)
+        .to_string();
+    let Some((host, port)) = contact_point.rsplit_once(':') else {
+        return contact_point;
+    };
+    if host.contains(':') && !host.starts_with('[') {
+        return format!("[{host}]:{port}");
+    }
+    contact_point
+}
+
 /// Returns a standard test configuration for Cassandra.
 pub fn test_config() -> CassandraStorageConfig {
     let mut config = CassandraStorageConfig {
-        contact_points: vec!["127.0.0.1:9042".to_string()],
+        contact_points: vec![test_contact_point()],
         username: Some("cassandra".to_string()),
         password: Some("cassandra".to_string()),
         keyspace_prefix: "extenddb_ttl_test".to_string(),
@@ -714,8 +737,10 @@ pub async fn put_item_then_lock(
 
 /// True when the suite should be skipped because no Cassandra is reachable.
 ///
+/// `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT` selects the node (default
+/// 127.0.0.1:9042), so parallel jobs on one host can use separate instances.
 /// The workspace `cargo test` job in test.yml runs with no services, so these
-/// suites probe 127.0.0.1:9042 and skip themselves when nothing is listening.
+/// suites probe that node and skip themselves when nothing is listening.
 /// The dedicated integration-cassandra workflow provides a service container
 /// and sets `EXTENDDB_TEST_CASSANDRA=required`, under which this never skips:
 /// if Cassandra is down there, setup fails loudly rather than the suite
@@ -725,15 +750,34 @@ pub fn skip_without_cassandra() -> bool {
     if std::env::var("EXTENDDB_TEST_CASSANDRA").as_deref() == Ok("required") {
         return false;
     }
-    let reachable = std::net::TcpStream::connect_timeout(
-        &std::net::SocketAddr::from(([127, 0, 0, 1], 9042)),
-        std::time::Duration::from_secs(2),
-    )
-    .is_ok();
+    let contact_point = test_contact_point();
+    let reachable = contact_point
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
+        });
     if !reachable {
         eprintln!(
-            "skipping: no Cassandra at 127.0.0.1:9042 (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
+            "skipping: no Cassandra at {contact_point} (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
         );
     }
     !reachable
+}
+
+#[cfg(test)]
+mod contact_point_tests {
+    use super::resolve_test_contact_point;
+
+    #[test]
+    fn contact_point_defaults_and_honours_an_override() {
+        assert_eq!(resolve_test_contact_point(None), "127.0.0.1:9042");
+        assert_eq!(
+            resolve_test_contact_point(Some("127.0.0.1:19042")),
+            "127.0.0.1:19042"
+        );
+        assert_eq!(resolve_test_contact_point(Some("::1:19042")), "[::1]:19042");
+        assert_eq!(resolve_test_contact_point(Some("  ")), "127.0.0.1:9042");
+    }
 }

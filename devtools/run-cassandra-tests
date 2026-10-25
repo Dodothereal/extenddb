@@ -29,7 +29,9 @@
 #
 # Prerequisites:
 #   - A Cassandra node reachable at the contact point (default 127.0.0.1:9042)
-#     with PasswordAuthenticator enabled. The official cassandra:4.1 image does
+#     with PasswordAuthenticator enabled. The direct Rust test harness reads
+#     EXTENDDB_TEST_CASSANDRA_CONTACT_POINT when it is set; the --contact-points
+#     option below configures the extenddb server and Python suite. The official cassandra:4.1 image does
 #     not honour CASSANDRA_AUTHENTICATOR, so patch it after starting:
 #       docker run -d --name cassandra -p 9042:9042 \
 #         -e CASSANDRA_CLUSTER_NAME=extenddb-ci \
