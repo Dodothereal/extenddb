@@ -55,24 +55,21 @@ fn test_contact_point() -> String {
 }
 
 fn resolve_test_contact_point(value: Option<&str>) -> String {
-    let contact_point = value
+    value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_TEST_CONTACT_POINT)
-        .to_string();
-    let Some((host, port)) = contact_point.rsplit_once(':') else {
-        return contact_point;
-    };
-    if host.contains(':') && !host.starts_with('[') {
-        return format!("[{host}]:{port}");
-    }
-    contact_point
+        .to_string()
 }
 
 /// Returns a standard test configuration for Cassandra.
 pub fn test_config() -> CassandraStorageConfig {
+    config_for(test_contact_point())
+}
+
+fn config_for(contact_point: String) -> CassandraStorageConfig {
     let mut config = CassandraStorageConfig {
-        contact_points: vec![test_contact_point()],
+        contact_points: vec![contact_point],
         username: Some("cassandra".to_string()),
         password: Some("cassandra".to_string()),
         keyspace_prefix: "extenddb_ttl_test".to_string(),
@@ -751,13 +748,7 @@ pub fn skip_without_cassandra() -> bool {
         return false;
     }
     let contact_point = test_contact_point();
-    let reachable = contact_point
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .is_some_and(|addr| {
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
-        });
+    let reachable = node_reachable(contact_point.as_str());
     if !reachable {
         eprintln!(
             "skipping: no Cassandra at {contact_point} (set EXTENDDB_TEST_CASSANDRA=required to fail instead)"
@@ -766,9 +757,18 @@ pub fn skip_without_cassandra() -> bool {
     !reachable
 }
 
+fn node_reachable(contact_point: impl ToSocketAddrs) -> bool {
+    contact_point.to_socket_addrs().is_ok_and(|mut addrs| {
+        addrs.any(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
+        })
+    })
+}
+
 #[cfg(test)]
 mod contact_point_tests {
-    use super::resolve_test_contact_point;
+    use super::{config_for, node_reachable, resolve_test_contact_point};
+    use std::net::TcpListener;
 
     #[test]
     fn contact_point_defaults_and_honours_an_override() {
@@ -777,7 +777,50 @@ mod contact_point_tests {
             resolve_test_contact_point(Some("127.0.0.1:19042")),
             "127.0.0.1:19042"
         );
-        assert_eq!(resolve_test_contact_point(Some("::1:19042")), "[::1]:19042");
+        assert_eq!(
+            resolve_test_contact_point(Some("  127.0.0.1:19042  ")),
+            "127.0.0.1:19042"
+        );
+        assert_eq!(resolve_test_contact_point(Some("")), "127.0.0.1:9042");
         assert_eq!(resolve_test_contact_point(Some("  ")), "127.0.0.1:9042");
+    }
+
+    #[test]
+    fn contact_point_does_not_rewrite_nonblank_values() {
+        for value in ["::1", "[::1]:19042", "127.0.0.1:19042,127.0.0.1:19043"] {
+            assert_eq!(resolve_test_contact_point(Some(value)), value);
+        }
+    }
+
+    #[test]
+    fn config_keeps_the_selected_contact_point() {
+        let config = config_for("127.0.0.1:19042".to_string());
+        assert_eq!(config.contact_points, vec!["127.0.0.1:19042"]);
+    }
+
+    #[test]
+    fn probe_uses_the_selected_contact_point() -> std::io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let contact_point = listener.local_addr()?.to_string();
+        assert!(node_reachable(contact_point.as_str()));
+        drop(listener);
+        assert!(!node_reachable(contact_point.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn probe_tries_later_resolved_addresses() -> std::io::Result<()> {
+        let first = TcpListener::bind("127.0.0.1:0")?;
+        let second = TcpListener::bind("127.0.0.1:0")?;
+        let addresses = [first.local_addr()?, second.local_addr()?];
+        drop(first);
+        assert!(!node_reachable(addresses[0]));
+        assert!(node_reachable(&addresses[..]));
+        Ok(())
+    }
+
+    #[test]
+    fn probe_rejects_an_invalid_contact_point() {
+        assert!(!node_reachable("127.0.0.1:not-a-port"));
     }
 }
